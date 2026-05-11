@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from opentelemetry import trace as otel_trace
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -66,8 +67,12 @@ def metrics() -> Response:
 def predict(req: PredictRequest) -> PredictResponse:
     INFERENCE_ACTIVE.inc()
     start = time.perf_counter()
-    span = tracer.start_span("predict")
-    span.set_attribute("gen_ai.request.model", req.model)
+
+    # Use the span already created by FastAPI auto-instrumentation as the root.
+    # Add GenAI semantic convention attributes to it directly.
+    root_span = otel_trace.get_current_span()
+    root_span.set_attribute("gen_ai.request.model", req.model)
+    root_span.set_attribute("gen_ai.system", "openai")
 
     try:
         if req.fail:
@@ -75,15 +80,18 @@ def predict(req: PredictRequest) -> PredictResponse:
             log.error("forced failure", model=req.model)
             raise HTTPException(status_code=503, detail="forced failure (alert demo)")
 
-        with tracer.start_as_current_span("embed-text") as s:
+        # Get tracer at call time (after setup_otel has run) so spans inherit context correctly
+        _tracer = otel_trace.get_tracer("inference-api")
+
+        with _tracer.start_as_current_span("embed-text") as s:
             s.set_attribute("text.length", len(req.prompt))
             time.sleep(0.005)
 
-        with tracer.start_as_current_span("vector-search") as s:
+        with _tracer.start_as_current_span("vector-search") as s:
             s.set_attribute("k", 5)
             time.sleep(0.010)
 
-        with tracer.start_as_current_span("generate-tokens") as s:
+        with _tracer.start_as_current_span("generate-tokens") as s:
             text, in_toks, out_toks, quality = simulate_inference(req.prompt, req.model)
             s.set_attribute("gen_ai.usage.input_tokens", in_toks)
             s.set_attribute("gen_ai.usage.output_tokens", out_toks)
@@ -97,7 +105,7 @@ def predict(req: PredictRequest) -> PredictResponse:
         elapsed = time.perf_counter() - start
         INFERENCE_LATENCY.labels(model=req.model).observe(elapsed)
 
-        trace_id = format(span.get_span_context().trace_id, "032x")
+        trace_id = format(root_span.get_span_context().trace_id, "032x")
         log.info(
             "prediction served",
             model=req.model,
@@ -117,4 +125,3 @@ def predict(req: PredictRequest) -> PredictResponse:
         )
     finally:
         INFERENCE_ACTIVE.dec()
-        span.end()

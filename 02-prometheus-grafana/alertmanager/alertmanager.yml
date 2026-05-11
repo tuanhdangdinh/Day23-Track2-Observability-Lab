@@ -1,6 +1,11 @@
 global:
   resolve_timeout: 1m
-  slack_api_url_file: ''   # we use webhook URL inline below
+  # SLACK_WEBHOOK_URL is injected via docker-compose environment → alertmanager
+  # reads it from the ALERTMANAGER_SLACK_API_URL env var automatically when
+  # global.slack_api_url is set to that env var reference.
+  # We use a file-based approach: docker-compose writes the URL into an env var
+  # and alertmanager picks it up via the global key below.
+  slack_api_url: '${SLACK_WEBHOOK_URL}'
 
 route:
   receiver: 'slack-default'
@@ -20,8 +25,7 @@ route:
 receivers:
   - name: 'slack-default'
     slack_configs:
-      - api_url: '{{ env "SLACK_WEBHOOK_URL" }}'
-        channel: '#observability'
+      - channel: '#observability'
         send_resolved: true
         title: '{{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
         text: |
@@ -33,8 +37,7 @@ receivers:
 
   - name: 'slack-critical'
     slack_configs:
-      - api_url: '{{ env "SLACK_WEBHOOK_URL" }}'
-        channel: '#oncall'
+      - channel: '#oncall'
         send_resolved: true
         title: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
         text: |
@@ -45,7 +48,6 @@ receivers:
           {{ end }}
 
 inhibit_rules:
-  # If the whole service is down, don't also page about latency on it.
   - source_matchers: [alertname = "ServiceDown"]
     target_matchers: [severity = "warning"]
     equal: [service]
