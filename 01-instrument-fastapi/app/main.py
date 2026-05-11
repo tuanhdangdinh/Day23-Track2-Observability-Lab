@@ -22,7 +22,6 @@ from instrumentation import (
     INFERENCE_TOKENS,
     bind_log,
     setup_otel,
-    tracer,
 )
 from inference import simulate_inference, simulate_gpu_load
 
@@ -68,60 +67,59 @@ def predict(req: PredictRequest) -> PredictResponse:
     INFERENCE_ACTIVE.inc()
     start = time.perf_counter()
 
-    # Use the span already created by FastAPI auto-instrumentation as the root.
-    # Add GenAI semantic convention attributes to it directly.
-    root_span = otel_trace.get_current_span()
-    root_span.set_attribute("gen_ai.request.model", req.model)
-    root_span.set_attribute("gen_ai.system", "openai")
+    # Get a fresh tracer at call time (after setup_otel has run) to avoid
+    # ProxyTracer context-propagation issues with FastAPI's thread pool.
+    tracer = otel_trace.get_tracer("inference-api")
 
-    try:
-        if req.fail:
-            INFERENCE_REQUESTS.labels(model=req.model, status="error").inc()
-            log.error("forced failure", model=req.model)
-            raise HTTPException(status_code=503, detail="forced failure (alert demo)")
+    with tracer.start_as_current_span("predict") as span:
+        span.set_attribute("gen_ai.request.model", req.model)
+        span.set_attribute("gen_ai.system", "openai")
 
-        # Get tracer at call time (after setup_otel has run) so spans inherit context correctly
-        _tracer = otel_trace.get_tracer("inference-api")
+        try:
+            if req.fail:
+                INFERENCE_REQUESTS.labels(model=req.model, status="error").inc()
+                log.error("forced failure", model=req.model)
+                raise HTTPException(status_code=503, detail="forced failure (alert demo)")
 
-        with _tracer.start_as_current_span("embed-text") as s:
-            s.set_attribute("text.length", len(req.prompt))
-            time.sleep(0.005)
+            with tracer.start_as_current_span("embed-text") as s:
+                s.set_attribute("text.length", len(req.prompt))
+                time.sleep(0.005)
 
-        with _tracer.start_as_current_span("vector-search") as s:
-            s.set_attribute("k", 5)
-            time.sleep(0.010)
+            with tracer.start_as_current_span("vector-search") as s:
+                s.set_attribute("k", 5)
+                time.sleep(0.010)
 
-        with _tracer.start_as_current_span("generate-tokens") as s:
-            text, in_toks, out_toks, quality = simulate_inference(req.prompt, req.model)
-            s.set_attribute("gen_ai.usage.input_tokens", in_toks)
-            s.set_attribute("gen_ai.usage.output_tokens", out_toks)
-            s.set_attribute("gen_ai.response.finish_reason", "stop")
+            with tracer.start_as_current_span("generate-tokens") as s:
+                text, in_toks, out_toks, quality = simulate_inference(req.prompt, req.model)
+                s.set_attribute("gen_ai.usage.input_tokens", in_toks)
+                s.set_attribute("gen_ai.usage.output_tokens", out_toks)
+                s.set_attribute("gen_ai.response.finish_reason", "stop")
 
-        INFERENCE_REQUESTS.labels(model=req.model, status="ok").inc()
-        INFERENCE_TOKENS.labels(model=req.model, direction="input").inc(in_toks)
-        INFERENCE_TOKENS.labels(model=req.model, direction="output").inc(out_toks)
-        INFERENCE_QUALITY.labels(model=req.model).set(quality)
+            INFERENCE_REQUESTS.labels(model=req.model, status="ok").inc()
+            INFERENCE_TOKENS.labels(model=req.model, direction="input").inc(in_toks)
+            INFERENCE_TOKENS.labels(model=req.model, direction="output").inc(out_toks)
+            INFERENCE_QUALITY.labels(model=req.model).set(quality)
 
-        elapsed = time.perf_counter() - start
-        INFERENCE_LATENCY.labels(model=req.model).observe(elapsed)
+            elapsed = time.perf_counter() - start
+            INFERENCE_LATENCY.labels(model=req.model).observe(elapsed)
 
-        trace_id = format(root_span.get_span_context().trace_id, "032x")
-        log.info(
-            "prediction served",
-            model=req.model,
-            input_tokens=in_toks,
-            output_tokens=out_toks,
-            quality=quality,
-            duration_seconds=round(elapsed, 4),
-            trace_id=trace_id,
-        )
-        return PredictResponse(
-            text=text,
-            model=req.model,
-            input_tokens=in_toks,
-            output_tokens=out_toks,
-            trace_id=trace_id,
-            quality_score=quality,
-        )
-    finally:
-        INFERENCE_ACTIVE.dec()
+            trace_id = format(span.get_span_context().trace_id, "032x")
+            log.info(
+                "prediction served",
+                model=req.model,
+                input_tokens=in_toks,
+                output_tokens=out_toks,
+                quality=quality,
+                duration_seconds=round(elapsed, 4),
+                trace_id=trace_id,
+            )
+            return PredictResponse(
+                text=text,
+                model=req.model,
+                input_tokens=in_toks,
+                output_tokens=out_toks,
+                trace_id=trace_id,
+                quality_score=quality,
+            )
+        finally:
+            INFERENCE_ACTIVE.dec()
